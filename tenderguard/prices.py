@@ -140,7 +140,7 @@ def add_price_stats(items: pd.DataFrame, tenders: pd.DataFrame) -> pd.DataFrame:
     items["region_median"] = by_region.transform("median")
     region_enough = by_region.transform("count") >= MIN_REGION_ANALOGS
     items["region_deviation_pct"] = ((items["unit_price"] / items["region_median"] - 1) * 100).where(region_enough)
-        items["price_deviation_pct"] = (items["unit_price"] / items["fair_price"] - 1) * 100
+    items["price_deviation_pct"] = (items["unit_price"] / items["fair_price"] - 1) * 100
     items["price_anomaly"] = items["fair_price"].notna() & (items["unit_price"] > items["upper_bound"])
     # Переплата: скільки заплатили понад справедливу ціну, якщо різниця більша за звичайний розкид
     overpriced = items["price_deviation_pct"] > NORMAL_SPREAD_PCT
