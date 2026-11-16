@@ -140,3 +140,34 @@ def add_price_stats(items: pd.DataFrame, tenders: pd.DataFrame) -> pd.DataFrame:
     items["region_median"] = by_region.transform("median")
     region_enough = by_region.transform("count") >= MIN_REGION_ANALOGS
     items["region_deviation_pct"] = ((items["unit_price"] / items["region_median"] - 1) * 100).where(region_enough)
+        items["price_deviation_pct"] = (items["unit_price"] / items["fair_price"] - 1) * 100
+    items["price_anomaly"] = items["fair_price"].notna() & (items["unit_price"] > items["upper_bound"])
+    # Переплата: скільки заплатили понад справедливу ціну, якщо різниця більша за звичайний розкид
+    overpriced = items["price_deviation_pct"] > NORMAL_SPREAD_PCT
+    items["overpay_uah"] = ((items["unit_price"] - items["fair_price"])
+                            * items["quantity"]).where(overpriced, 0).fillna(0)
+    return items
+
+
+def no_competition_premium_pct(items: pd.DataFrame) -> float | None:
+    """На скільки відсотків типово (медіана) дорожча ціна в закупівлях з одним учасником,
+    ніж справедлива ціна. Медіана, бо кілька гігантських контрактів не повинні все перекосити."""
+    single = items[(items["bidders"] == 1) & items["fair_price"].notna()]
+    if single.empty:
+        return None
+    return float(single["price_deviation_pct"].median())
+
+
+def summarize_by_tender(items: pd.DataFrame) -> pd.DataFrame:
+    """Для кожної закупівлі: найдорожчий відносно норми товар (для пояснення) і загальна переплата."""
+    priced = items.dropna(subset=["price_deviation_pct"])
+    worst = priced.loc[priced.groupby("id")["price_deviation_pct"].idxmax()]
+    worst = worst[["id", "fuel_type", "unit_price", "median_price", "fair_price", "fair_basis", "upper_bound",
+                   "analogs", "price_deviation_pct", "price_anomaly", "region_median", "region_deviation_pct"]]
+    overpay = items.groupby("id", as_index=False)["overpay_uah"].sum()
+    return overpay.merge(worst, on="id", how="left")
+
+
+def analogs_of(items: pd.DataFrame, fuel_type: str) -> pd.DataFrame:
+    """Усі закупівлі того самого виду пального з відомою ціною (для графіка)."""
+    return items[(items["fuel_type"] == fuel_type) & items["unit_price"].notna()]
