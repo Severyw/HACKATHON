@@ -1,116 +1,119 @@
-"""Завантаження завершених закупівель пального з відкритого API Prozorro у data/fuel.jsonl.
+"""Завантаження закупівель пального з JSONL і перетворення на таблиці pandas.
 
-Запуск: python -m tenderguard.prozorro_api 10000
-Переглядає 10 000 останніх завершених конкурентних закупівель і зберігає з них лише пальне.
-Так отримано наш data/fuel.jsonl: 1258 закупівель пального з 10 063 переглянутих.
+Дві таблиці:
+- tenders: один рядок = одна закупівля (замовник, переможець, учасники, суми);
+- items:   один рядок = один товар у закупівлі (вид пального, літри, ціна за літр).
 """
 from __future__ import annotations
 
 import json
-import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Iterator
 
-import requests
+import pandas as pd
 
-BASE_URL = "https://public-api.prozorro.gov.ua/api/2.5"
-DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "fuel.jsonl"
-# Лише конкурентні процедури: у «звітах» про прямі договори немає учасників
-COMPETITIVE = {"aboveThreshold", "belowThreshold", "priceQuotation", "aboveThresholdUA", "aboveThresholdEU"}
-# Коди ДК 021 (CPV) пального: 0913… — нафтопродукти (бензин, дизель), 09122… — пропан і бутан
-FUEL_CPV_PREFIXES = ("0913", "09122")
+PROZORRO_URL = "https://prozorro.gov.ua/tender/{}"
+NO_REGION = "Область не вказана"  # військові замовники часто не публікують адресу
+VAT_RATE = 0.20  # ПДВ на пальне
 
 
-def iter_completed_ids() -> Iterator[list[str]]:
-    """Гортає стрічку закупівель від найновіших; повертає сторінками ID завершених конкурентних."""
-    url = f"{BASE_URL}/tenders"
-    params = {"descending": 1, "limit": 1000, "opt_fields": "status,procurementMethodType"}
-    while True:
-        page = requests.get(url, params=params, timeout=30).json()
-        if not page["data"]:
-            return
-        yield [
-            t["id"] for t in page["data"]
-            if t.get("status") == "complete" and t.get("procurementMethodType") in COMPETITIVE
-        ]
-        url, params = page["next_page"]["uri"], None
+def read_jsonl(path: str | Path) -> list[dict]:
+    """Читає файл, де кожен рядок — одна закупівля у форматі JSON."""
+    with open(path, encoding="utf-8") as file:
+        return [json.loads(line) for line in file if line.strip()]
 
 
-def fetch_tender(tender_id: str) -> dict | None:
-    """Деталі однієї закупівлі. Три спроби, бо API іноді відповідає з помилкою."""
-    for _ in range(3):
-        try:
-            response = requests.get(f"{BASE_URL}/tenders/{tender_id}", timeout=30)
-            response.raise_for_status()
-            return response.json()["data"]
-        except (requests.RequestException, KeyError, ValueError):
-            continue
-    return None
+def _active_award(tender: dict) -> dict | None:
+    """Рішення про переможця (award зі статусом active), якщо воно є."""
+    return next((a for a in tender.get("awards", []) if a.get("status") == "active"), None)
 
 
-def is_fuel(tender: dict) -> bool:
-    """Закупівля пального: усі товари мають CPV-код пального."""
+def _winning_bid(tender: dict) -> dict | None:
+    """Пропозиція переможця: саме в ній є ціна за одиницю кожного товару."""
+    award = _active_award(tender) or {}
+    return next((b for b in tender.get("bids", []) if b.get("id") == award.get("bid_id")), None)
+
+
+def _count_bidders(tender: dict) -> int:
+    """Кількість унікальних учасників (за кодом ЄДРПОУ)."""
+    return len({
+        tenderer["identifier"]["id"]
+        for bid in tender.get("bids", [])
+        for tenderer in bid.get("tenderers", [])
+    })
+
+
+def _period_days(period: dict | None) -> float | None:
+    """Скільки днів давали на подання пропозицій."""
+    if not period or not period.get("startDate") or not period.get("endDate"):
+        return None
+    return (pd.Timestamp(period["endDate"]) - pd.Timestamp(period["startDate"])).total_seconds() / 86400
+
+
+def flatten_tender(tender: dict) -> dict:
+    """Вкладений JSON закупівлі → один плаский рядок таблиці tenders."""
+    buyer = tender.get("procuringEntity", {})
+    award = _active_award(tender) or {}
+    supplier = (award.get("suppliers") or [{}])[0]
+    return {
+        "id": tender["id"],
+        "tender_id": tender.get("tenderID"),
+        "title": tender.get("title"),
+        "method": tender.get("procurementMethodType"),
+        "date": pd.Timestamp(tender.get("date")),
+        "buyer": buyer.get("name"),
+        "buyer_id": buyer.get("identifier", {}).get("id"),
+        "region": buyer.get("address", {}).get("region") or NO_REGION,
+        "currency": tender.get("value", {}).get("currency"),
+        "expected_value": tender.get("value", {}).get("amount"),
+        "final_value": award.get("value", {}).get("amount"),
+        "vat_included": bool(award.get("value", {}).get("valueAddedTaxIncluded")),
+        "winner": supplier.get("name"),
+        "winner_id": supplier.get("identifier", {}).get("id"),
+        "bidders": _count_bidders(tender),
+        "period_days": _period_days(tender.get("tenderPeriod")),
+        "url": PROZORRO_URL.format(tender.get("tenderID")),
+    }
+
+
+def flatten_items(tender: dict) -> list[dict]:
+    """Товари закупівлі з ціною за одиницю з пропозиції переможця.
+
+    Якщо у пропозиції ціни за одиницю немає, а товар один, ділимо суму договору на кількість
+    (і прибираємо ПДВ, якщо сума вказана з ним).
+    """
+    bid_prices = {
+        item.get("id"): ((item.get("unit") or {}).get("value") or {}).get("amount")
+        for item in (_winning_bid(tender) or {}).get("items", [])
+    }
     items = tender.get("items", [])
-    return bool(items) and all(
-        item.get("classification", {}).get("id", "").startswith(FUEL_CPV_PREFIXES) for item in items
-    )
+    award_value = (_active_award(tender) or {}).get("value") or {}
+    rows = []
+    for item in items:
+        price = bid_prices.get(item.get("id"))
+        if price is None and len(items) == 1 and award_value.get("amount") and item.get("quantity"):
+            price = award_value["amount"] / item["quantity"]
+            if award_value.get("valueAddedTaxIncluded"):
+                price /= 1 + VAT_RATE  # порівнюємо всі ціни без ПДВ
+        rows.append({
+            "id": tender["id"],
+            "description": item.get("description"),
+            "cpv": (item.get("classification") or {}).get("id"),
+            "unit": (item.get("unit") or {}).get("name"),
+            "quantity": item.get("quantity"),
+            "unit_price": price,
+        })
+    return rows
 
 
-def _organization(org: dict) -> dict:
-    """Лише назва, код ЄДРПОУ та область, без контактів людей."""
-    return {
-        "name": org.get("name"),
-        "identifier": {"id": org.get("identifier", {}).get("id")},
-        "address": {"region": org.get("address", {}).get("region")},
-    }
+def load_data(path: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Головна функція модуля: файл → (tenders, items). Лише гривні та закупівлі з переможцем."""
+    raw = list({t["id"]: t for t in read_jsonl(path)}.values())  # кожна закупівля один раз
+    tenders = pd.DataFrame([flatten_tender(t) for t in raw])
+    tenders = tenders[(tenders["currency"] == "UAH") & tenders["final_value"].notna()
+                      & (tenders["expected_value"] > 0)].reset_index(drop=True)
+    tenders["savings_pct"] = (tenders["expected_value"] - tenders["final_value"]) / tenders["expected_value"] * 100
 
-
-def compact(tender: dict) -> dict:
-    """Залишає лише поля, потрібні для аналізу (повний запис займає ~90 КБ)."""
-    keep = ("id", "tenderID", "title", "status", "procurementMethodType",
-            "mainProcurementCategory", "value", "tenderPeriod", "dateCreated", "date")
-    return {
-        **{key: tender.get(key) for key in keep},
-        "procuringEntity": _organization(tender.get("procuringEntity", {})),
-        "items": [
-            {k: item.get(k) for k in ("id", "description", "quantity", "unit", "classification")}
-            for item in tender.get("items", [])
-        ],
-        "bids": [
-            {"id": b.get("id"), "status": b.get("status"), "value": b.get("value"),
-             "tenderers": [_organization(t) for t in b.get("tenderers", [])],
-             # ціна за одиницю кожного товару в пропозиції
-             "items": [{"id": i.get("id"), "quantity": i.get("quantity"), "unit": i.get("unit")}
-                       for i in b.get("items", [])]}
-            for b in tender.get("bids", [])
-        ],
-        "awards": [
-            {"status": a.get("status"), "value": a.get("value"), "bid_id": a.get("bid_id"),
-             "suppliers": [_organization(s) for s in a.get("suppliers", [])]}
-            for a in tender.get("awards", [])
-        ],
-    }
-
-
-def download(scan: int = 10_000, path: Path = DATA_PATH, workers: int = 24) -> int:
-    """Переглядає scan останніх завершених закупівель і зберігає з них пальне. Деталі тягне паралельно."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    saved = scanned = 0
-    with open(path, "w", encoding="utf-8") as file, ThreadPoolExecutor(max_workers=workers) as pool:
-        for ids in iter_completed_ids():
-            for tender in pool.map(fetch_tender, ids):
-                scanned += 1
-                if tender and is_fuel(tender):
-                    file.write(json.dumps(compact(tender), ensure_ascii=False) + "\n")
-                    saved += 1
-            print(f"переглянуто {scanned}, пального {saved}", flush=True)
-            if scanned >= scan:
-                break
-    return saved
-
-
-if __name__ == "__main__":
-    to_scan = int(sys.argv[1]) if len(sys.argv) > 1 else 10_000
-    print(f"Збережено {download(to_scan)} закупівель пального у {DATA_PATH}")
-  
+    # Однакові рядки товарів не прибираємо: це можуть бути два однакові лоти в одній закупівлі
+    items = pd.DataFrame([row for t in raw for row in flatten_items(t)])
+    items = items[items["id"].isin(tenders["id"])].reset_index(drop=True)
+    return tenders, items
